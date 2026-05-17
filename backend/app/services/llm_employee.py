@@ -21,6 +21,35 @@ import structlog
 
 logger = structlog.get_logger()
 
+# Lazy imports for LLM providers
+_openai_client = None
+_groq_client = None
+_anthropic_client = None
+
+
+def _get_openai_client():
+    global _openai_client
+    if _openai_client is None and settings.openai_api_key:
+        from openai import AsyncOpenAI
+        _openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
+    return _openai_client
+
+
+def _get_groq_client():
+    global _groq_client
+    if _groq_client is None and settings.groq_api_key:
+        from groq import AsyncGroq
+        _groq_client = AsyncGroq(api_key=settings.groq_api_key)
+    return _groq_client
+
+
+def _get_anthropic_client():
+    global _anthropic_client
+    if _anthropic_client is None and settings.anthropic_api_key:
+        import anthropic
+        _anthropic_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    return _anthropic_client
+
 
 class LLMEmployeeService:
     """LLM-powered employee decision-making and execution."""
@@ -39,6 +68,66 @@ class LLMEmployeeService:
             return {"provider": "anthropic", "model": "claude-3-sonnet-20240229"}
         else:
             return {"provider": "deterministic", "model": "rule_based"}
+
+    async def _call_llm(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        """Call the configured LLM provider with the given prompt."""
+        provider = self._llm_client["provider"]
+        model = self._llm_client["model"]
+
+        try:
+            if provider == "openai":
+                client = _get_openai_client()
+                if client is None:
+                    raise Exception("OpenAI client not initialized")
+                messages = []
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": prompt})
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=2000,
+                    response_format={"type": "json_object"}
+                )
+                return response.choices[0].message.content
+
+            elif provider == "groq":
+                client = _get_groq_client()
+                if client is None:
+                    raise Exception("Groq client not initialized")
+                messages = []
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": prompt})
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=2000,
+                    response_format={"type": "json_object"}
+                )
+                return response.choices[0].message.content
+
+            elif provider == "anthropic":
+                client = _get_anthropic_client()
+                if client is None:
+                    raise Exception("Anthropic client not initialized")
+                full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
+                response = await client.messages.create(
+                    model=model,
+                    max_tokens=2000,
+                    temperature=0.3,
+                    messages=[{"role": "user", "content": full_prompt}]
+                )
+                return response.content[0].text
+
+            else:
+                return None  # Fallback to deterministic
+
+        except Exception as e:
+            logger.error(f"LLM call failed: {e}")
+            return None
 
     async def analyze_opportunity(
         self,
@@ -67,8 +156,27 @@ class LLMEmployeeService:
         if self._llm_client["provider"] == "deterministic":
             analysis = self._deterministic_analysis(employee, opp, context)
         else:
-            # In production: call actual LLM API
-            analysis = self._deterministic_analysis(employee, opp, context)
+            # Call actual LLM API
+            llm_response = await self._call_llm(analysis_prompt, employee.system_prompt)
+            if llm_response:
+                try:
+                    analysis = json.loads(llm_response)
+                    # Validate required fields
+                    if "decision" not in analysis:
+                        analysis["decision"] = "escalate"
+                    if "reasoning" not in analysis:
+                        analysis["reasoning"] = "LLM analysis completed"
+                    if "confidence" not in analysis:
+                        analysis["confidence"] = 0.7
+                    if "risk_assessment" not in analysis:
+                        analysis["risk_assessment"] = "medium"
+                    if "suggested_actions" not in analysis:
+                        analysis["suggested_actions"] = []
+                except json.JSONDecodeError:
+                    # Fallback to deterministic if LLM returns invalid JSON
+                    analysis = self._deterministic_analysis(employee, opp, context)
+            else:
+                analysis = self._deterministic_analysis(employee, opp, context)
 
         # Store in memory for future reference
         mem = await get_memory_layer()
@@ -178,7 +286,7 @@ Provide your analysis in JSON format:
             confidence = 0.6
 
         # Profit mandate check
-        if employee.profit_mandate:
+        if employee.profit_mandate and isinstance(employee.profit_mandate, dict):
             min_profit = employee.profit_mandate.get("min_profit_percent", 0)
             if opportunity.expected_profit_percent < min_profit:
                 decision = "reject"
@@ -186,7 +294,7 @@ Provide your analysis in JSON format:
                 confidence = 0.7
 
         # Risk limit check
-        if employee.risk_limit and opportunity.risk_score:
+        if employee.risk_limit and isinstance(employee.risk_limit, dict) and opportunity.risk_score:
             max_risk = employee.risk_limit.get("max_risk_score", 1.0)
             if opportunity.risk_score > max_risk:
                 decision = "reject"
